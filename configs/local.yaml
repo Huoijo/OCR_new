@@ -1,0 +1,10 @@
+project_name: ura_ocr_cpu_m1
+
+paths:
+  raw_data_dir: data/raw
+  train_images_dir: data/raw/train_images
+  test_images_dir: data/raw/test_images
+  outputs_dir: outputs
+  cache_dir: outputs/cache
+  debug_images_dir: outputs/debug_images
+  submissions_dir: outputs/submissions

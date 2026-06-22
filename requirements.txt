@@ -1,0 +1,11 @@
+numpy
+pandas
+opencv-python
+pillow
+rapidfuzz
+tqdm
+pyyaml
+matplotlib
+jupyter
+streamlit
+pytesseract

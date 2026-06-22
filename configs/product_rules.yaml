@@ -1,0 +1,4 @@
+product_rules:
+  enabled: true
+  fuzzy_threshold: 88
+  strong_threshold: 94

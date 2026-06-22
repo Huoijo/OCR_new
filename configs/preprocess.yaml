@@ -1,0 +1,16 @@
+preprocess:
+  target_short_side: 900
+  max_long_side: 1600
+
+  clahe:
+    enabled: true
+    clip_limit: 2.0
+    tile_grid_size: [8, 8]
+
+  sharpen:
+    enabled: true
+
+  hard_fallback:
+    enabled: true
+    adaptive_block_size: 31
+    adaptive_c: 11

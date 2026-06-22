@@ -1,0 +1,61 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+.venv_paddle/
+venv/
+env/
+
+# MacOS
+.DS_Store
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local env / secrets
+.env
+.env.*
+*.env
+
+# Data - do not commit competition data
+data/
+data/raw/
+data/interim/
+data/processed/
+data/samples/
+
+# Outputs - do not commit generated files
+outputs/
+outputs/cache/
+outputs/debug_images/
+outputs/audits/
+outputs/submissions/
+outputs/logs/
+
+# Model/cache files
+.paddleocr/
+.paddlex/
+.paddle/
+.cache/
+models/
+checkpoints/
+
+# Large archives
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.7z
+
+# Logs
+*.log
+
+# Temporary files
+tmp/
+temp/
