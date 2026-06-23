@@ -637,14 +637,9 @@ def _make_hard_threshold(
 
     gray = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
 
-    # Mild local contrast before thresholding
-    clahe = cv.createCLAHE(
-        clipLimit=2.0,
-        tileGridSize=(8, 8),
-    )
-
-    gray = clahe.apply(gray)
-
+    # Do not apply CLAHE before hard thresholding.
+    # Tuning showed that no_clahe_c11_div28 improves mainstream CER
+    # while keeping adaptive gaussian C=11 and block_divisor=28.
     if mode == "otsu":
         _, th = cv.threshold(
             gray,
