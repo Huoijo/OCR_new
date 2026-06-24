@@ -763,14 +763,12 @@ def generate_candidates_for_row(
         else:
             cand.variant_agreement_score = 0.0
 
-        out.append(cand)
-
+        out.append(cand)    
     # Contextual filter: drop standalone legal/noisy short candidates
     # (CTCP/Công ty/Cổ phần ...; CP only when context isn't a true CP product).
     full_text = _row_full_text(row)
     if full_text:
         out = [c for c in out if keep_candidate(c.clean_text, full_text)]
-
     out.sort(
         key=lambda c: (
             SOURCE_PRIORITY.get(c.source, 0),
