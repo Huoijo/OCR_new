@@ -15,6 +15,7 @@ from .B_gazeetteer import (
     fold_key,
     fold_token_key,
 )
+from .rules import should_reject_short_candidate
 
 
 # ---------------------------------------------------------------------
@@ -490,13 +491,23 @@ def link_one_candidate(
     strong_threshold: float = DEFAULT_STRONG_THRESHOLD,
     max_pool_entries: int = 80,
     top_k_matches: int = 5,
+    full_text: str = "",
 ) -> Dict[str, Any]:
     """
     Link one candidate to the best gazetteer entry, if score is high enough.
 
     Important: this does NOT decide the final product_name for the image.
     It only enriches a candidate row with match metadata for Cell 4.
+
+    full_text: optional image OCR text used by the rule registry to drop
+    contextually-bad short/legal candidates (e.g. standalone CP/CTCP) before
+    they can fuzzy-link.
     """
+
+    if full_text:
+        cand_text = _safe_str(_get(candidate_row, "clean_text")) or _safe_str(_get(candidate_row, "raw_text"))
+        if cand_text and should_reject_short_candidate(cand_text, full_text):
+            return _empty_link_result("rule_rejected_short_candidate:%s" % cand_text[:40])
 
     entries = gazetteer.lookup_candidates(candidate_row, max_entries=max_pool_entries)
     if not entries:
@@ -567,6 +578,7 @@ def link_candidates_with_gazetteer(
     max_pool_entries: int = 80,
     top_k_matches: int = 5,
     show_progress: bool = False,
+    image_text_map: Optional[Mapping[str, str]] = None,
 ) -> pd.DataFrame:
     """
     Main function of Cell 3.
@@ -588,6 +600,17 @@ def link_candidates_with_gazetteer(
             out[k] = v
         return out
 
+    # Per-image OCR text for rule-based short-candidate rejection.
+    text_map: Dict[str, str] = {str(k): str(v) for k, v in (image_text_map or {}).items()}
+    if not text_map:
+        for col in ("ocr_text", "selected_text"):
+            if col in candidate_df.columns and "image_id" in candidate_df.columns:
+                for img, sub in candidate_df.groupby("image_id", sort=False):
+                    vals = [v for v in sub[col].dropna().astype(str).tolist() if v.strip()]
+                    if vals:
+                        text_map[str(img)] = max(vals, key=len)
+                break
+
     rows = []
     iterator = candidate_df.iterrows()
 
@@ -600,6 +623,7 @@ def link_candidates_with_gazetteer(
             pass
 
     for _, row in iterator:
+        img_id = _safe_str(_get(row, "image_id"))
         rows.append(
             link_one_candidate(
                 candidate_row=row,
@@ -608,6 +632,7 @@ def link_candidates_with_gazetteer(
                 strong_threshold=strong_threshold,
                 max_pool_entries=max_pool_entries,
                 top_k_matches=top_k_matches,
+                full_text=text_map.get(img_id, ""),
             )
         )
 

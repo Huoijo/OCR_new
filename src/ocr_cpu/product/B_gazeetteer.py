@@ -280,6 +280,43 @@ class ProductGazetteer:
     ambiguous_anchors: Dict[str, Set[str]]
     metadata: Dict[str, Any] = field(default_factory=dict)
 
+    def enrich_with_rule_aliases(self, aliases: Optional[Dict[str, str]] = None) -> int:
+        """
+        Add hand-curated rule aliases (product/rules.py) as extra surface lookups.
+
+        For each {normalized_alias: canonical}, resolve the existing entry whose
+        canonical matches, then register the alias (diacritic + folded form) in the
+        surface indices so a candidate equal to the alias retrieves that entry.
+        Purely additive; never removes/merges entries. Returns #surfaces added.
+        """
+        try:
+            from .rules import get_rule_aliases
+        except Exception:
+            return 0
+        aliases = aliases if aliases is not None else get_rule_aliases()
+        added = 0
+        for alias_norm, canonical in aliases.items():
+            ck = normalize_dedupe_key(canonical)
+            eid = self.exact_index.get(ck)
+            if not eid:
+                fids = self.folded_exact_index.get(fold_key(canonical), [])
+                eid = fids[0] if fids else None
+            if not eid or eid not in self.entry_by_id:
+                continue
+            dk = normalize_dedupe_key(alias_norm)
+            fk = fold_key(alias_norm)
+            for idx, key in ((self.surface_index, dk), (self.folded_surface_index, fk)):
+                if not key:
+                    continue
+                lst = idx.setdefault(key, [])
+                if eid not in lst:
+                    lst.append(eid)
+                    added += 1
+        if added:
+            self.metadata["n_rule_alias_surfaces_added"] = int(
+                self.metadata.get("n_rule_alias_surfaces_added", 0)) + added
+        return added
+
     def lookup_candidates(
         self,
         candidate_row: Union[pd.Series, Mapping[str, Any]],
@@ -830,6 +867,7 @@ def build_product_gazetteer(
     filler_top_k: int = 300,
     filler_max_product_row_ratio: float = 0.02,
     cache_json_path: Optional[Union[str, Path]] = None,
+    apply_rule_aliases: bool = True,
 ) -> ProductGazetteer:
     """
     Build Cell 2 ProductGazetteer from train_labels.csv.
@@ -933,6 +971,9 @@ def build_product_gazetteer(
         ambiguous_anchors=ambiguous_anchors,
         metadata=metadata,
     )
+
+    if apply_rule_aliases:
+        gazetteer.enrich_with_rule_aliases()
 
     if cache_json_path:
         gazetteer.save_json(cache_json_path)

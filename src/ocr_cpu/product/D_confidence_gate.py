@@ -10,6 +10,13 @@ import pandas as pd
 
 from .A_candidate import normalize_light, normalize_dedupe_key, tokenize_text
 from .B_gazeetteer import fold_key, fold_token_key
+from .rules import (
+    apply_all_rules,
+    is_generic_topic_only,
+    should_reject_short_candidate,
+)
+
+log = __import__("logging").getLogger("ocr_cpu.product.gate")
 
 
 # ---------------------------------------------------------------------
@@ -210,6 +217,11 @@ class GateConfig:
 
     # Debug output.
     top_k_debug_candidates: int = 10
+
+    # Centralized rule registry (product/rules.py) integration.
+    use_rules: bool = True               # apply rule override / short-candidate reject / generic gate
+    rule_override_priority: int = 90     # a rule hit >= this forces its canonical (beats fuzzy)
+    rule_strong_priority: int = 95       # below this, a generic-topic image is blanked
 
 
 @dataclass
@@ -717,7 +729,14 @@ def _image_folded_token_pool(matched: pd.DataFrame) -> frozenset:
 def _dedup_entries(entries: Sequence[EntryEvidence]) -> List[EntryEvidence]:
     """Drop entries whose token set is a subset of an already-kept (richer) entry."""
 
-    ordered = sorted(entries, key=lambda e: (len(e.folded_tokens), e.best_gate_score), reverse=True)
+    # Richest first; among equal token sets prefer the canonical with the higher
+    # frequency prior (clean Title-Case form, e.g. "Pate Cột Đèn Hải Phòng" over a
+    # messy-casing duplicate), then gate score.
+    ordered = sorted(
+        entries,
+        key=lambda e: (len(e.folded_tokens), e.frequency_prior, e.best_gate_score),
+        reverse=True,
+    )
     kept: List[EntryEvidence] = []
     for e in ordered:
         if not e.folded_tokens:
@@ -810,17 +829,69 @@ def _select_full_or_compose(
             "reason": f"compose_{len(chosen)}_atomics",
         }
 
-    # 3. Single best qualified entry.
+    # 3. Single best qualified entry. Drop entries whose token set is a subset of
+    #    a richer qualified entry first (a brand-only "PATE" is subsumed by the
+    #    specific "Pate Cột Đèn Hải Phòng"), then prefer a high-trust exact match
+    #    over a fuzzy one. This avoids losing the specific product to a generic
+    #    brand whose fuzzy match happened to have a larger (spurious) margin.
     if qualified:
-        best = max(qualified, key=lambda e: (e.best_gate_score, e.best_match_score, e.frequency_prior, e.entry_id))
+        candidates = _dedup_entries(qualified) or list(qualified)
+        best = max(
+            candidates,
+            key=lambda e: (
+                e.best_match_type in HIGH_TRUST_MATCH_TYPES,
+                e.best_gate_score,
+                e.best_match_score,
+                e.frequency_prior,
+                e.entry_id,
+            ),
+        )
         return {
             "mode": "single",
             "entries": [best],
-            "is_ambiguous": _is_ambiguous_single(best, qualified, config),
+            "is_ambiguous": _is_ambiguous_single(best, candidates, config),
             "reason": "single_best_qualified",
         }
 
     return None
+
+
+def _rule_override_decision(
+    image_id: str,
+    hit: Dict[str, Any],
+    context: Mapping[str, Any],
+    top_candidates_json: str = "[]",
+) -> GateDecision:
+    """Force a high-confidence rule hit as the image decision (precision-first)."""
+    canonical = hit["canonical"]
+    log.info("[Gate] chosen=%s source=%s priority=%s (rule override)",
+             canonical, hit.get("source"), hit.get("priority"))
+    return GateDecision(
+        image_id=str(image_id),
+        product_name_candidate=canonical,
+        emit_product=True,
+        gate_score=1.0,
+        gate_decision="emit",
+        gate_reason="rule_override:%s|priority=%s|source=%s" % (
+            hit.get("rule_name"), hit.get("priority"), hit.get("source")),
+        matched_display=canonical,
+        match_score=float(hit.get("score", 1.0)) * 100.0,
+        match_type="rule:%s" % hit.get("source", "rule"),
+        negative_context_count=int(context.get("negative_context_count", 0) or 0),
+        positive_context_count=int(context.get("positive_context_count", 0) or 0),
+        negative_context_hits=list(context.get("negative_context_hits", []) or []),
+        positive_context_hits=list(context.get("positive_context_hits", []) or []),
+        compose_mode="single",
+        chosen_displays=[canonical],
+        top_candidates_json=top_candidates_json,
+    )
+
+
+def _best_rule_hit(full_text: str) -> Optional[Dict[str, Any]]:
+    """Top rule hit (after rejecting contextually-bad short candidates), or None."""
+    hits = [h for h in apply_all_rules(full_text)
+            if not should_reject_short_candidate(h["canonical"], full_text)]
+    return hits[0] if hits else None
 
 
 def gate_one_image(
@@ -828,18 +899,32 @@ def gate_one_image(
     group: pd.DataFrame,
     config: GateConfig,
     max_frequency_prior: int,
+    full_text: str = "",
 ) -> GateDecision:
     """
     Main image-level gate.
 
     Input group is all linked candidates for one image_id.
     Output is one decision: product_name_candidate or blank.
+
+    full_text: optional raw OCR text for the image. When empty it is derived
+    from candidate texts; it feeds the centralized rule registry (rules.py).
     """
 
     if group is None or group.empty:
         return _blank_decision(str(image_id), "no_candidates")
 
     context = compute_context_evidence(group)
+
+    # ---- Centralized rule registry: precision-first override ----
+    rule_text = full_text or context.get("image_context_text", "") or image_text_from_group(group)
+    rule_hit = _best_rule_hit(rule_text) if config.use_rules else None
+    if rule_hit is not None:
+        log.info("[Rule] hit=%s canonical=%s priority=%s",
+                 rule_hit.get("rule_name"), rule_hit.get("canonical"), rule_hit.get("priority"))
+    if rule_hit is not None and int(rule_hit.get("priority", 0)) >= config.rule_override_priority:
+        top_json = _top_candidates_debug(group.copy(), config.top_k_debug_candidates)
+        return _rule_override_decision(str(image_id), rule_hit, context, top_json)
 
     matched = group[group.get("matched", False).fillna(False).astype(bool)].copy()
     if matched.empty:
@@ -923,6 +1008,23 @@ def gate_one_image(
             top_json,
         )
 
+    # Generic topic-only precision guard: a news/topic headline with only a
+    # weak fuzzy match and no strong rule should blank (precision-first).
+    if (
+        config.use_rules
+        and is_generic_topic_only(rule_text)
+        and not (rule_hit and int(rule_hit.get("priority", 0)) >= config.rule_strong_priority)
+        and primary.best_match_type in FUZZY_PARTIAL_TYPES
+        and not any_specific
+    ):
+        log.info("[Gate] generic topic only + weak fuzzy -> blank (image=%s)", image_id)
+        return _blank_decision(
+            str(image_id),
+            "generic_topic_only_weak_fuzzy",
+            context,
+            top_json,
+        )
+
     # Compose final product_name candidate (Cell 5 still does Title Case / brand fix).
     if selection["mode"] == "multi":
         product_name = config.compose_join.join(e.display for e in chosen)
@@ -990,6 +1092,7 @@ def apply_confidence_gating(
     linked_candidate_df: pd.DataFrame,
     config: Optional[GateConfig] = None,
     show_progress: bool = False,
+    image_text_map: Optional[Mapping[str, str]] = None,
 ) -> pd.DataFrame:
     """
     Main function of Cell 4.
@@ -1021,6 +1124,18 @@ def apply_confidence_gating(
 
     max_prior = int(pd.to_numeric(df["matched_frequency_prior"], errors="coerce").fillna(0).max())
 
+    # Build per-image raw OCR text for the rule registry. Prefer an explicit
+    # map (E_predict passes one), else recover from any ocr/selected text column.
+    text_map: Dict[str, str] = {str(k): str(v) for k, v in (image_text_map or {}).items()}
+    if not text_map:
+        for col in ("ocr_text", "selected_text"):
+            if col in df.columns:
+                for img, sub in df.groupby("image_id", sort=False):
+                    vals = [v for v in sub[col].dropna().astype(str).tolist() if v.strip()]
+                    if vals:
+                        text_map[str(img)] = max(vals, key=len)
+                break
+
     decisions: List[GateDecision] = []
     grouped = df.groupby("image_id", sort=False)
     iterator = grouped
@@ -1040,8 +1155,23 @@ def apply_confidence_gating(
                 group=group,
                 config=config,
                 max_frequency_prior=max_prior,
+                full_text=text_map.get(str(image_id), ""),
             )
         )
+
+    # Rescue: an image whose OCR is so noisy it produced no candidate group can
+    # still be emitted by a strong rule (precision-first). Only possible when the
+    # caller supplies image_text_map covering all target images (orchestrator job).
+    if config.use_rules and text_map:
+        decided = {d.image_id for d in decisions}
+        for img, full_text in text_map.items():
+            if str(img) in decided or not full_text:
+                continue
+            rule_hit = _best_rule_hit(full_text)
+            if rule_hit and int(rule_hit.get("priority", 0)) >= config.rule_override_priority:
+                log.info("[Rule] rescue image=%s hit=%s priority=%s",
+                         img, rule_hit.get("rule_name"), rule_hit.get("priority"))
+                decisions.append(_rule_override_decision(str(img), rule_hit, {}))
 
     return pd.DataFrame([d.to_dict() for d in decisions])
 

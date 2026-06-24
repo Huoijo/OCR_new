@@ -15,6 +15,8 @@ try:
 except Exception:
     from .B_gazetteer import ProductGazetteer
 
+from .rules import resolve_product_name
+
 
 # ---------------------------------------------------------------------
 # Config
@@ -173,6 +175,62 @@ def normalize_ocr_output_text(text: Any) -> str:
     s = re.sub(r"[ ]*\n[ ]*", "\n", s)
     s = re.sub(r"\n{3,}", "\n\n", s)
     return s.strip()
+
+
+# WHITELIST (robust), not a blacklist. We list what is ALLOWED in real
+# Vietnamese/Latin text and drop everything else, so any junk script/symbol we
+# have never seen before (a new emoji, Cyrillic, Thai, Arabic, CJK, box-drawing)
+# is removed automatically -- no maintenance, no "new char slips through" bug.
+#
+# Allowed (after NFC):
+#   \x20-\x7E  ASCII printable  -> a-z A-Z 0-9 space + all common punctuation
+#   00C0-024F  Latin-1 Suppl + Latin Extended-A/B  -> Vietnamese a/d-bar/o-horn...
+#   1E00-1EFF  Latin Extended Additional           -> a-dot a-hook a-acute ... y
+#   0300-036F  combining diacritics (safety net for un-composable decomposed VN)
+#   2010-2027  common typographic punctuation (dashes, curly quotes, ellipsis, bullet)
+#   20AB       Vietnamese dong sign
+#   whitespace (collapsed afterwards)
+_KEEP_RE = re.compile(
+    "[^"
+    "\x20-\x7e"
+    "\u00c0-\u024f"
+    "\u1e00-\u1eff"
+    "\u0300-\u036f"
+    "\u2010-\u2027"
+    "\u20ab"
+    r"\s"
+    "]+"
+)
+
+# A "real" Vietnamese/Latin word: >= 3 letters in a row (ASCII or precomposed VN).
+_HAS_WORD_RE = re.compile(r"[0-9A-Za-zÀ-ɏḀ-ỿ]{3,}")
+
+
+def clean_ocr_text_for_output(text: Any, drop_junk_only: bool = True) -> str:
+    """
+    Optional, opt-in cleanup of the submission `ocr_text` column.
+
+    1. NFC + collapse to a single line (so decomposed Vietnamese composes first,
+       never strip a standalone tone mark).
+    2. WHITELIST filter: keep only ASCII + Latin/Vietnamese letters + common
+       punctuation; drop every other script/symbol. Future-proof -- unseen junk
+       (new emoji, CJK, Cyrillic, Thai...) is removed without code changes.
+    3. If drop_junk_only and what remains has NO real word (no >=3-letter run),
+       blank it — the image was OCR garbage (e.g. 'D 5 DD a EA D 8 O 5 G O O D').
+
+    NOTE: train ground-truth ocr_text is noisy and a few rows legitimately contain
+    CJK, so this is OFF by default in the pipeline; enable + measure CER on train
+    (Cell 6) before trusting it for the final submission.
+    """
+    s = normalize_ocr_output_text(text)
+    if not s:
+        return ""
+    s = s.replace("\n", " ")
+    s = _KEEP_RE.sub(" ", s)
+    s = re.sub(r"\s+", " ", s).strip()
+    if drop_junk_only and not _HAS_WORD_RE.search(s):
+        return ""
+    return s
 
 
 def _split_plus_items(display: str) -> List[str]:
@@ -345,6 +403,27 @@ def build_final_product_name(
 
     displays = _dedupe_preserve_order(displays) if config.deduplicate_items else list(displays)
     return normalize_output_text(config.joiner.join(displays))
+
+
+def predict_product_name_from_text(
+    ocr_text: str,
+    extra_candidates: Optional[Sequence[str]] = None,
+    verbose: bool = False,
+) -> str:
+    """
+    Rule-first single-text orchestration entry point.
+
+    Applies the centralized rule registry (product/rules.py) to one OCR string
+    and returns the final, output-normalized product_name ("" for blank). This
+    is the lightweight path used for debugging / unit tests; the full batch flow
+    is A -> C -> D (which already applies the same rules via the gate) -> E.
+    """
+    name, _hit = resolve_product_name(
+        ocr_text,
+        extra_candidates=list(extra_candidates) if extra_candidates else None,
+        verbose=verbose,
+    )
+    return normalize_output_text(name)
 
 
 def finalize_product_predictions(

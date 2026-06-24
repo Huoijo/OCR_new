@@ -8,6 +8,25 @@ import pandas as pd
 
 from ..ocr.A_candidate_sp import selection_to_product_input_fields
 from ..ocr.quality import OCRSelection
+from .rules import should_reject_short_candidate
+
+
+def _row_full_text(row: pd.Series) -> str:
+    """Best-effort raw OCR text for a candidate row (for contextual rule checks)."""
+    for col in ("ocr_text", "selected_text", "raw_text"):
+        val = _safe_str(row.get(col)) if hasattr(row, "get") else ""
+        if val.strip():
+            return val
+    return ""
+
+
+def keep_candidate(candidate: str, full_text: str) -> bool:
+    """Drop empty / contextually-bad short candidates (CP handled by context)."""
+    if not str(candidate).strip():
+        return False
+    if should_reject_short_candidate(candidate, full_text):
+        return False
+    return True
 
 VARIANT_COLUMN_MAP = {
     "selected": {
@@ -442,6 +461,68 @@ def dedup_rank(c: ProductCandidate) -> Tuple:
         len(c.clean_text),
     )
 
+def cross_line_ngram_records(
+    line_records: List[Dict[str, Any]],
+    filler_tokens: Optional[Set[str]] = None,
+    min_n: int = 2,
+    max_n: int = 6,
+    window_lines: int = 2,
+    max_flat_tokens: int = 60,
+) -> List[Dict[str, Any]]:
+    """
+    Sinh ngram span vắt qua ranh giới các dòng OCR liền kề.
+
+    PaddleOCR hay tách một tên sản phẩm thành 2 dòng vật lý
+    (vd dòng A '... patê côt đèn' + dòng B 'Hài Phòng ...'). Candidate
+    per-line không bao giờ ghép lại nên full-key không hình thành. Ở đây
+    ta nối token của `window_lines` dòng liên tiếp rồi trượt cửa sổ ngram,
+    CHỈ giữ những cửa sổ thực sự cắt qua ít nhất một ranh giới dòng
+    (để không trùng với ngram trong-dòng đã sinh ở chỗ khác).
+    """
+    # Token mỗi dòng (đã strip filler), theo thứ tự đọc.
+    per_line: List[Tuple[int, List[str], Dict[str, Any]]] = []
+    for rec in line_records:
+        toks = strip_filler_tokens(tokenize_text(rec["clean_text"]), filler_tokens)
+        if toks:
+            li = rec["line_index"] if rec["line_index"] is not None else len(per_line)
+            per_line.append((li, toks, rec))
+    per_line.sort(key=lambda x: x[0])
+
+    out: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    for i in range(len(per_line)):
+        window = per_line[i : i + window_lines]
+        if len(window) < 2:
+            continue
+
+        flat: List[str] = []
+        boundaries: List[int] = []          # vị trí trong flat nơi một dòng mới bắt đầu
+        base_rec = window[0][2]
+        for (_, toks, _rec) in window:
+            if flat:
+                boundaries.append(len(flat))
+            flat.extend(toks)
+        if len(flat) > max_flat_tokens:     # an toàn, tránh bùng nổ
+            continue
+
+        upper = min(max_n, len(flat))
+        for n in range(min_n, upper + 1):
+            for start in range(0, len(flat) - n + 1):
+                end = start + n
+                # chỉ giữ cửa sổ cắt qua ranh giới dòng
+                if not any(start < b < end for b in boundaries):
+                    continue
+                ng = flat[start:end]
+                ng_clean = detokenize(ng)
+                if structural_filter_reason(ng_clean, ng, max_tokens=max_n) is not None:
+                    continue
+                key = normalize_dedupe_key(ng_clean)
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                out.append({"ng": list(ng), "ng_clean": ng_clean, "key": key, "rec": base_rec})
+    return out
 
 def generate_candidates_for_row(
     row: pd.Series,
@@ -451,6 +532,9 @@ def generate_candidates_for_row(
     image_dims: Optional[Tuple[int, int]] = None,
     ngram_all_lines: bool = False,
     max_line_tokens_for_ngram: int = 40,
+    cross_line_ngrams: bool = True,        # NEW — fix A
+    max_cross_line_window: int = 2,        # NEW — số dòng liền kề gộp
+    max_cross_line_ngram: int = 6,
 ) -> List[ProductCandidate]:
     image_id = _safe_str(row.get("image_id"))
 
@@ -616,7 +700,42 @@ def generate_candidates_for_row(
                             )
                         )
 
+        # Cross-line ngrams: ghép token các dòng liền kề để bắt tên SP bị OCR
+        # tách dòng (vd 'patê côt đèn' | 'Hài Phòng' -> 'patê côt đèn Hài Phòng').
+        if cross_line_ngrams and len(line_records) >= 2:
+            for item in cross_line_ngram_records(
+                line_records,
+                filler_tokens=filler_tokens,
+                min_n=2,
+                max_n=max_cross_line_ngram,
+                window_lines=max_cross_line_window,
+            ):
+                rec = item["rec"]
+                ng = item["ng"]
+                ng_clean = item["ng_clean"]
+                raw_candidates.append(
+                    ProductCandidate(
+                        image_id=image_id,
+                        variant=variant_name,
+                        source="ngram",
+                        raw_text=ng_clean,
+                        clean_text=ng_clean,
+                        tokenized=list(ng),
+                        ngram_span=None,
+                        line_index=rec["line_index"],
+                        ocr_conf=rec["ocr_conf"],
+                        bbox_coords=None,
+                        position_score=rec["position_score"],
+                        structure_score=compute_structure_score(ng_clean, ng, "ngram"),
+                        matched=False,
+                        source_score=SOURCE_SCORE_MAP["ngram"],
+                        normalized_key=item["key"],
+                        available_variant_count=available_variant_count,
+                    )
+                )
+
     best_by_key: Dict[str, ProductCandidate] = {}
+    
     variant_sets: Dict[str, Set[str]] = {}
 
     for cand in raw_candidates:
@@ -645,6 +764,12 @@ def generate_candidates_for_row(
             cand.variant_agreement_score = 0.0
 
         out.append(cand)
+
+    # Contextual filter: drop standalone legal/noisy short candidates
+    # (CTCP/Công ty/Cổ phần ...; CP only when context isn't a true CP product).
+    full_text = _row_full_text(row)
+    if full_text:
+        out = [c for c in out if keep_candidate(c.clean_text, full_text)]
 
     out.sort(
         key=lambda c: (
@@ -685,6 +810,9 @@ def generate_candidate_dataframe(
     image_height_col: Optional[str] = None,
     ngram_all_lines: bool = False,
     max_line_tokens_for_ngram: int = 40,
+    cross_line_ngrams: bool = True,
+    max_cross_line_window: int = 2,
+    max_cross_line_ngram: int = 6,
 ) -> pd.DataFrame:
     all_candidates: List[ProductCandidate] = []
 
@@ -708,6 +836,9 @@ def generate_candidate_dataframe(
                 image_dims=image_dims,
                 ngram_all_lines=ngram_all_lines,
                 max_line_tokens_for_ngram=max_line_tokens_for_ngram,
+                cross_line_ngrams=cross_line_ngrams,
+                max_cross_line_window=max_cross_line_window,
+                max_cross_line_ngram=max_cross_line_ngram,
             )
         )
 
@@ -768,6 +899,9 @@ def selections_to_candidate_dataframe(
     image_height_col: Optional[str] = None,
     ngram_all_lines: bool = False,
     max_line_tokens_for_ngram: int = 40,
+    cross_line_ngrams: bool = True,
+    max_cross_line_window: int = 2,
+    max_cross_line_ngram: int = 6,
 ) -> pd.DataFrame:
     """
     One-shot bridge: OCR pipeline output -> product candidate DataFrame.
@@ -791,6 +925,9 @@ def selections_to_candidate_dataframe(
         image_height_col=image_height_col,
         ngram_all_lines=ngram_all_lines,
         max_line_tokens_for_ngram=max_line_tokens_for_ngram,
+        cross_line_ngrams=cross_line_ngrams,
+        max_cross_line_window=max_cross_line_window,
+        max_cross_line_ngram=max_cross_line_ngram,
     )
 
 
